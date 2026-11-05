@@ -43,7 +43,9 @@ A whole chosen address is impossible on any hardware, at about 10²¹ years even
 | `lxmf-vanity`, CPU | Apple M5 Max (18 cores) | 109 million |
 | `lxmf-vanity --gpu` (Metal) | Apple M5 Max (40-core GPU) | 158 million |
 | `lxmf-vanity --gpu --cpu` | Apple M5 Max, GPU and 17 CPU cores | 258 million |
+| `lxmf-vanity`, CPU | NVIDIA GB10 (20 Arm cores) | 75 million |
 | `lxmf-vanity --gpu` (CUDA) | 1 × NVIDIA GB10 (DGX Spark) | 630 million |
+| `lxmf-vanity --gpu --cpu` | 1 × NVIDIA GB10, GPU and 19 CPU cores | 620 million (no gain) |
 | `fleet.sh` | 4 × NVIDIA GB10 | 2.5 billion |
 
 On the same Mac, the key-walking method is about 350 times faster than generating fresh identities in Python.
@@ -82,8 +84,17 @@ On the same Mac, the key-walking method is about 350 times faster than generatin
 | `4444444444` | 24 min 42 s | `4444444444b096c63932086235515550` |
 | `5555555555` | 7 min 48 s | `5555555555f1c4afd2259752b3f6bf44` |
 | `6666666666` | 6 min 39 s | `66666666660b4b3f068937c4b2f17ea6` |
+| `7777777777` | 1 min 23 s | `77777777771ce2a18b6ee3e66389cf70` |
+| `8888888888` | 6 min 52 s | `888888888835045d3674302778983d99` |
+| `9999999999` | 1 min 48 s | `9999999999dd4260d8f51fb8e66536be` |
+| `aaaaaaaaaa` | 3 min 20 s | `aaaaaaaaaa92aad0889b836223fa6c0b` |
+| `bbbbbbbbbb` | 5 min 48 s | `bbbbbbbbbbce9c4b467035865386b67f` |
+| `cccccccccc` | 2 min 22 s | `cccccccccc37979c8e259c649fd9f1ab` |
+| `dddddddddd` | 13 min 13 s | `ddddddddddb9465c323df7b22dbe0cca` |
+| `eeeeeeeeee` | 6 min 30 s | `eeeeeeeeee47f9796eabcc990c2e9888` |
+| `ffffffffff` | 12 min 4 s | `ffffffffff5100e06d37b06e496e0b58` |
 
-Times vary widely because each try is an independent chance. A search is no closer to finishing after 10 minutes than when it started.
+The 16 searches took 1 h 59 min in all, an average of 7 min 28 s, against 7 min 20 s expected at 2.5 billion keys a second. The fastest took 47 s and the slowest 24 min 42 s. Times vary widely because each try is an independent chance. A search is no closer to finishing after 10 minutes than when it started.
 
 ## On a Mac's GPU
 
@@ -107,7 +118,7 @@ cargo build --release --features cuda
 ./target/release/lxmf-vanity --gpu 0000000000
 ```
 
-`--gpu --cpu` works here too (not measured on a GB10).
+`--gpu --cpu` works here too, but on a GB10 it gains nothing: 620 million keys a second against 617 million for the GPU alone, though the CPU alone does 75 million. The GB10's CPU and GPU are one chip with a shared power budget, which is the likely reason (not measured).
 
 If the CUDA libraries aren't found, set `LD_LIBRARY_PATH=/usr/local/cuda/lib64`.
 
