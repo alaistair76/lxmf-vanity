@@ -94,7 +94,7 @@ On the same Mac, the key-walking method is about 350 times faster than generatin
 | `eeeeeeeeee` | 6 min 30 s | `eeeeeeeeee47f9796eabcc990c2e9888` |
 | `ffffffffff` | 12 min 4 s | `ffffffffff5100e06d37b06e496e0b58` |
 
-The 16 searches took 1 h 59 min in all, an average of 7 min 28 s, against 7 min 20 s expected at 2.5 billion keys a second. The fastest took 47 s and the slowest 24 min 42 s. Times vary widely because each try is an independent chance. A search is no closer to finishing after 10 minutes than when it started.
+The 16 searches took 1 h 55 min in all, an average of 7 min 11 s, against 7 min 20 s expected at 2.5 billion keys a second. The fastest took 47 s and the slowest 24 min 42 s. Times vary widely because each try is an independent chance. A search is no closer to finishing after 10 minutes than when it started.
 
 ## On a Mac's GPU
 
