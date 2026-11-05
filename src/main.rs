@@ -37,7 +37,7 @@ const BATCH: usize = 256;
 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 const ASPECTS: &[u8] = b"lxmf.delivery";
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", target_os = "macos"))]
 mod gpu;
 
 // ---- Field arithmetic mod 2^255 - 19, on fiat-crypto's verified primitives.
@@ -322,26 +322,87 @@ fn search(prefix: &Prefix, tries: &AtomicU64, found: &AtomicBool, hit: &Mutex<Op
     }
 }
 
-const USAGE: &str = "usage: lxmf-vanity [--gpu] <hex prefix>
+const USAGE: &str = "usage: lxmf-vanity [--gpu [--cpu]] <hex prefix>
        lxmf-vanity --gpu-self-test
 
 Finds a Reticulum identity whose LXMF address starts with the prefix and
-saves it to <prefix>.identity (readable only by you). --gpu searches on the
-first NVIDIA GPU (needs a build with --features cuda).";
+saves it to <prefix>.identity (readable only by you).
 
-/// Searches on every CPU core; returns the identity and the keys tried.
-fn search_cpu(prefix: &Prefix) -> ([u8; 64], u64) {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+  (no flag)        search on every CPU core
+  --gpu            search on the GPU: Metal on a Mac, CUDA elsewhere
+                   (CUDA needs a build with --features cuda)
+  --gpu --cpu      search on the GPU and the remaining CPU cores together
+  --gpu-self-test  check the GPU's results against the CPU";
+
+/// Opens the GPU, or exits saying why not.
+#[cfg(any(feature = "cuda", target_os = "macos"))]
+fn open_gpu() -> gpu::GpuSearch {
+    let started = Instant::now();
+    let gpu = gpu::GpuSearch::open().unwrap_or_else(|e| {
+        eprintln!("GPU unavailable: {e}");
+        exit(1)
+    });
+    println!("{}, ready in {:.1} s.", gpu.describe(), started.elapsed().as_secs_f64());
+    gpu
+}
+
+#[cfg(not(any(feature = "cuda", target_os = "macos")))]
+mod gpu {
+    pub struct GpuSearch;
+}
+
+#[cfg(not(any(feature = "cuda", target_os = "macos")))]
+fn open_gpu() -> gpu::GpuSearch {
+    eprintln!("This build has no GPU support: on Linux, build with --features cuda.");
+    exit(1)
+}
+
+/// Searches on `cpu_threads` CPU threads and, with `use_gpu`, the GPU, until
+/// one finds a match. Returns the identity and the keys tried.
+fn run_search(prefix: &Prefix, use_gpu: bool, cpu_threads: usize) -> ([u8; 64], u64) {
     let expected = 16f64.powi(prefix.nibbles as i32);
-    println!("Searching on {threads} CPU threads; about {expected:.0} tries on average.");
-
     let tries = AtomicU64::new(0);
     let found = AtomicBool::new(false);
     let hit = Mutex::new(None);
+    let gpu_error: Mutex<Option<String>> = Mutex::new(None);
+    #[cfg(not(any(feature = "cuda", target_os = "macos")))]
+    if use_gpu {
+        open_gpu(); // says why not, and exits
+    }
+
+    let mut on = Vec::new();
+    if use_gpu {
+        on.push("the GPU".to_string());
+    }
+    if cpu_threads > 0 {
+        on.push(format!("{cpu_threads} CPU threads"));
+    }
+    println!("Searching on {}; about {expected:.0} tries on average.", on.join(" and "));
+
     let start = Instant::now();
     std::thread::scope(|s| {
-        for _ in 0..threads {
+        for _ in 0..cpu_threads {
             s.spawn(|| search(prefix, &tries, &found, &hit));
+        }
+        // The GPU is opened on its own thread: its handles can't move between threads.
+        #[cfg(any(feature = "cuda", target_os = "macos"))]
+        if use_gpu {
+            let (tries, found, hit, gpu_error) = (&tries, &found, &hit, &gpu_error);
+            s.spawn(move || {
+                let started = Instant::now();
+                // A panic here must stop the search, not leave it waiting.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gpu::GpuSearch::open().and_then(|mut gpu| {
+                        println!("{}, ready in {:.1} s.", gpu.describe(), started.elapsed().as_secs_f64());
+                        gpu.run(prefix, found, tries, hit)
+                    })
+                }))
+                .unwrap_or_else(|_| Err("the GPU thread crashed".to_string()));
+                if let Err(e) = result {
+                    *gpu_error.lock().unwrap() = Some(format!("GPU: {e}"));
+                    found.store(true, Ordering::Relaxed);
+                }
+            });
         }
         let mut next_report = start + REPORT_INTERVAL;
         while !found.load(Ordering::Relaxed) {
@@ -350,62 +411,49 @@ fn search_cpu(prefix: &Prefix) -> ([u8; 64], u64) {
                 let done = tries.load(Ordering::Relaxed) as f64;
                 let rate = done / start.elapsed().as_secs_f64();
                 let left = (expected - done).max(0.0) / rate / 60.0;
-                println!("{done:.0} tries, {rate:.0}/s; the average is about {left:.0} min away");
+                if done < expected {
+                    println!("{done:.0} tries, {rate:.0}/s; the average is about {left:.0} min away");
+                } else {
+                    println!("{done:.0} tries, {rate:.0}/s; past the average, still searching");
+                }
                 next_report += REPORT_INTERVAL;
             }
         }
     });
+    if let Some(e) = gpu_error.lock().unwrap().take() {
+        eprintln!("{e}");
+        exit(2);
+    }
     let identity = hit.lock().unwrap().expect("found without a hit");
     (identity, tries.load(Ordering::Relaxed))
-}
-
-#[cfg(feature = "cuda")]
-fn open_gpu() -> gpu::Gpu {
-    let started = Instant::now();
-    let gpu = gpu::Gpu::new().unwrap_or_else(|e| {
-        eprintln!("GPU unavailable: {e}");
-        exit(1)
-    });
-    println!("{}: {} GPU threads, set up in {:.1} s.", gpu.device, gpu.threads(), started.elapsed().as_secs_f64());
-    gpu
-}
-
-#[cfg(feature = "cuda")]
-fn search_gpu(prefix: &Prefix) -> ([u8; 64], u64) {
-    let mut gpu = open_gpu();
-    println!("Searching on the GPU; about {:.0} tries on average.", 16f64.powi(prefix.nibbles as i32));
-    gpu.search(prefix).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        exit(2)
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn search_gpu(_: &Prefix) -> ([u8; 64], u64) {
-    eprintln!("This build has no GPU support: cargo build --release --features cuda");
-    exit(1)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flags: Vec<&str> = args.iter().filter(|a| a.starts_with("--")).map(|a| a.as_str()).collect();
     let words: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    if flags.iter().any(|f| *f != "--gpu" && *f != "--gpu-self-test") {
+    let use_gpu = flags.contains(&"--gpu");
+    let with_cpu = flags.contains(&"--cpu");
+    let known = ["--gpu", "--cpu", "--gpu-self-test"];
+    if flags.iter().any(|f| !known.contains(f)) || (with_cpu && !use_gpu) {
         eprintln!("{USAGE}");
         exit(1);
     }
 
     if flags.contains(&"--gpu-self-test") {
-        #[cfg(feature = "cuda")]
-        {
-            open_gpu().self_test().unwrap_or_else(|e| {
+        #[cfg(any(feature = "cuda", target_os = "macos"))]
+        match open_gpu().self_test() {
+            Ok(report) => {
+                println!("Self-test passed: {report}");
+                return;
+            }
+            Err(e) => {
                 eprintln!("Self-test FAILED: {e}");
                 exit(2)
-            });
-            return;
+            }
         }
-        #[cfg(not(feature = "cuda"))]
-        search_gpu(&Prefix::parse("0").unwrap());
+        #[cfg(not(any(feature = "cuda", target_os = "macos")))]
+        open_gpu();
     }
 
     if words.len() != 1 {
@@ -423,8 +471,15 @@ fn main() {
     }
     println!("Looking for an LXMF address starting {}.", words[0].to_ascii_lowercase());
 
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // With the GPU, one core is left to drive it.
+    let cpu_threads = match (use_gpu, with_cpu) {
+        (false, _) => cores,
+        (true, false) => 0,
+        (true, true) => cores.saturating_sub(1).max(1),
+    };
     let start = Instant::now();
-    let (identity, tried) = if flags.contains(&"--gpu") { search_gpu(&prefix) } else { search_cpu(&prefix) };
+    let (identity, tried) = run_search(&prefix, use_gpu, cpu_threads);
 
     let mut file = OpenOptions::new()
         .write(true)

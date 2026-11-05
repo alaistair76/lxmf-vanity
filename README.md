@@ -1,6 +1,6 @@
 # lxmf-vanity
 
-Finds a [Reticulum](https://reticulum.network) identity whose LXMF address starts with a chosen hex prefix, such as `b00b1e5…` or `0000000000…`, on CPU cores, an NVIDIA GPU, or several GPU machines at once. The result is a standard 64-byte Reticulum identity file that you can load into Sideband, MeshChat or NomadNet.
+Finds a [Reticulum](https://reticulum.network) identity whose LXMF address starts with a chosen hex prefix, such as `b00b1e5…` or `0000000000…`, on CPU cores, an Apple GPU (Metal), an NVIDIA GPU (CUDA), or several GPU machines at once. The result is a standard 64-byte Reticulum identity file that you can load into Sideband, MeshChat or NomadNet.
 
 ```sh
 cargo build --release
@@ -16,15 +16,15 @@ Prefixes are hex only: 0–9 and a–f (zero, not the letter O).
 
 Each extra hex digit means 16 times as many tries.
 
-| Prefix length | Tries on average | Apple M5 Max CPU (106 M/s) | One NVIDIA GB10 (630 M/s) | Four GB10s (2.5 G/s) |
-|---|---|---|---|---|
-| 7 | 268 million | 2.5 s | under 1 s | under 1 s |
-| 8 | 4.3 billion | 40 s | 7 s | 2 s |
-| 9 | 69 billion | 11 min | 2 min | 27 s |
-| 10 | 1.1 trillion | 3 h | 29 min | 7 min |
-| 11 | 18 trillion | 2 days | 8 h | 2 h |
-| 12 | 281 trillion | 1 month | 5 days | 31 h |
-| 32 (the whole address) | 2¹²⁸ | never | never | never |
+| Prefix length | Tries on average | M5 Max CPU (109 M/s) | M5 Max GPU + CPU (258 M/s) | One NVIDIA GB10 (630 M/s) | Four GB10s (2.5 G/s) |
+|---|---|---|---|---|---|
+| 7 | 268 million | 2.5 s | 1 s | under 1 s | under 1 s |
+| 8 | 4.3 billion | 40 s | 17 s | 7 s | 2 s |
+| 9 | 69 billion | 11 min | 4.5 min | 2 min | 27 s |
+| 10 | 1.1 trillion | 3 h | 71 min | 29 min | 7 min |
+| 11 | 18 trillion | 2 days | 19 h | 8 h | 2 h |
+| 12 | 281 trillion | 1 month | 13 days | 5 days | 31 h |
+| 32 (the whole address) | 2¹²⁸ | never | never | never | never |
 
 These are averages: about 1 search in 20 takes three times as long. The rates come from the measurements below.
 
@@ -40,13 +40,27 @@ A whole chosen address is impossible on any hardware, at about 10²¹ years even
 | Python loop, every core | AMD Ryzen 9 7900X (10 threads) | 100,000 |
 | Python loop, every core | Apple M5 Max (18 cores) | 300,000 |
 | `lxmf-vanity`, CPU | AMD Ryzen 9 7900X (10 threads) | 28 million |
-| `lxmf-vanity`, CPU | Apple M5 Max (18 cores) | 106 million |
-| `lxmf-vanity --gpu` | 1 × NVIDIA GB10 (DGX Spark) | 630 million |
+| `lxmf-vanity`, CPU | Apple M5 Max (18 cores) | 109 million |
+| `lxmf-vanity --gpu` (Metal) | Apple M5 Max (40-core GPU) | 158 million |
+| `lxmf-vanity --gpu --cpu` | Apple M5 Max, GPU and 17 CPU cores | 258 million |
+| `lxmf-vanity --gpu` (CUDA) | 1 × NVIDIA GB10 (DGX Spark) | 630 million |
 | `fleet.sh` | 4 × NVIDIA GB10 | 2.5 billion |
 
 On the same Mac, the key-walking method is about 350 times faster than generating fresh identities in Python.
 
 **The GB10 figures are with the GPU clock limited.** The SM clock ran at 2,190 MHz of a possible 3,003 MHz, drawing about 65 W. The kernel is limited by arithmetic, so a GPU at full clock should be faster, perhaps by up to a third. That hasn't been measured.
+
+**Why the Apple GPU is slower than the GB10.** The field arithmetic is built on 32×32→64-bit integer multiplies, with 64-bit sums. NVIDIA GPUs have a native instruction for that multiply. Apple GPUs are built mainly for 32-bit and floating-point work, so the same code probably costs them several instructions per step. That's an explanation, not a profile. On a Mac, use `--gpu --cpu`: the CPU adds about as much again.
+
+**Apple M5 Max GPU tuning.** These were measured while other work was running, so they're comparisons rather than exact figures:
+
+| Keys per inversion | GPU threads | Keys per second |
+|---|---|---|
+| 32 | 64 K | 87–125 million |
+| 64 | 128 K | 136 million |
+| 128 | 128 K | 142 million |
+| 256 | 128 K | 154 million (used) |
+| 256 | 256 K | 143 million |
 
 **GPU tuning, one GB10:**
 
@@ -65,8 +79,23 @@ On the same Mac, the key-walking method is about 350 times faster than generatin
 | `1111111111` | 1 min 35 s | `111111111126ad771ee92dec3f19d900` |
 | `2222222222` | 47 s | `22222222227948a1ad00e597df2b57ef` |
 | `3333333333` | 13 min 56 s | `3333333333e0f202ce5a3c9813ceaef1` |
+| `4444444444` | 24 min 42 s | `4444444444b096c63932086235515550` |
+| `5555555555` | 7 min 48 s | `5555555555f1c4afd2259752b3f6bf44` |
+| `6666666666` | 6 min 39 s | `66666666660b4b3f068937c4b2f17ea6` |
 
 Times vary widely because each try is an independent chance. A search is no closer to finishing after 10 minutes than when it started.
+
+## On a Mac's GPU
+
+Metal support is built in on macOS; there's nothing extra to install.
+
+```sh
+cargo build --release
+./target/release/lxmf-vanity --gpu-self-test     # checks the GPU against the CPU
+./target/release/lxmf-vanity --gpu --cpu c0ffee1ce
+```
+
+`--gpu` alone uses just the GPU. `--gpu --cpu` adds every CPU core but one, which drives the GPU. `LXMF_VANITY_GPU_THREADS` changes the number of GPU threads (131072 by default).
 
 ## On an NVIDIA GPU
 
@@ -77,6 +106,8 @@ cargo build --release --features cuda
 ./target/release/lxmf-vanity --gpu-self-test     # checks the GPU against the CPU
 ./target/release/lxmf-vanity --gpu 0000000000
 ```
+
+`--gpu --cpu` works here too (not measured on a GB10).
 
 If the CUDA libraries aren't found, set `LD_LIBRARY_PATH=/usr/local/cuda/lib64`.
 
@@ -122,7 +153,9 @@ Making a fresh pair of keys for every try is slow. Instead:
 - **Fixed Ed25519 key:** each CPU or GPU thread picks one random Ed25519 key and keeps it.
 - **Stepping X25519 keys:** it walks X25519 private keys `k, k+8, k+16, …` from a random start. Steps of 8 keep each key valid as it is.
 - **Cheap public keys:** each public key comes from the previous two by Montgomery differential addition, a handful of field multiplications instead of a full scalar multiplication.
-- **Shared inversions:** the projective Z coordinates are inverted 64 at a time with Montgomery's trick.
+- **Shared inversions:** the projective Z coordinates are inverted in batches with Montgomery's trick: 64 keys per inversion on CUDA, 256 on Metal.
+
+One copy of the GPU code, `src/gpu/common.h`, serves both GPUs. `kernel.cu` and `kernel.metal` only adapt it, with type names, address spaces and atomics.
 
 **Checking results:**
 - Every match, from the CPU or GPU, is recomputed from scratch with `x25519-dalek` before it's saved.

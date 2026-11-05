@@ -1,40 +1,47 @@
-// GPU half of lxmf-vanity: each thread walks X25519 private keys k, k+8,
-// k+16, ... (k chosen on the host), derives each LXMF address, and records
-// those that match the prefix. The host rechecks every hit on the CPU.
+// The GPU search, shared by CUDA (kernel.cu) and Metal (kernel.metal). Each
+// of those defines, before including this file:
+//
+//   i32 u32 i64 u64   integer types
+//   FN                qualifiers for a device-side helper function
+//   TABLE             qualifiers for a read-only lookup table
+//   GLOBAL            the address space of kernel buffers
+//   LOCAL_U32_PTR     a pointer to a thread's own u32 array (i64 likewise)
+//   LOCAL_I64_PTR
+//   HIT_COUNTER       the type of the hit counter (an atomic on Metal)
+//   ATOMIC_INC(p)     add 1 to *p and return the old value
+//   rotr(x, n)        rotate right
+//   bswap(x)          reverse the bytes of a 32-bit word
+//   BATCH             keys per batch inversion (set by the host)
+//
+// Each thread walks X25519 private keys k, k+8, k+16, ... (k chosen on the
+// host), derives each LXMF address, and records those matching the prefix.
+// The host rechecks every hit on the CPU.
 //
 // Field elements mod 2^255-19 use ref10's 10-limb signed radix 2^25.5
-// (limb i at bit ceil(25.5 i)), so products are native 32x32->64 multiplies.
+// (limb i at bit ceil(25.5 i)), so products are 32x32->64 multiplies.
 // "Tight" values come out of fe_mul; adding or subtracting two tight values
 // gives a "loose" value that fe_mul accepts without overflow.
 
-typedef int i32;
-typedef unsigned int u32;
-typedef long long i64;
-typedef unsigned long long u64;
-
-#ifndef BATCH
-#define BATCH 64  // keys per batch inversion; the host passes -DBATCH
-#endif
-
 struct fe { i32 v[10]; };
 
-__device__ __constant__ int LIMB_BIT[10] = {0, 26, 51, 77, 102, 128, 153, 179, 204, 230};
+// Where limb i starts: ceil(25.5 i).
+FN int limb_bit(int i) { return (51 * i + 1) >> 1; }
 
-__device__ __forceinline__ fe fe_add(const fe& f, const fe& g) {
+FN fe fe_add(fe f, fe g) {
     fe h;
 #pragma unroll
     for (int i = 0; i < 10; i++) h.v[i] = f.v[i] + g.v[i];
     return h;
 }
 
-__device__ __forceinline__ fe fe_sub(const fe& f, const fe& g) {
+FN fe fe_sub(fe f, fe g) {
     fe h;
 #pragma unroll
     for (int i = 0; i < 10; i++) h.v[i] = f.v[i] - g.v[i];
     return h;
 }
 
-__device__ __forceinline__ fe fe_one() {
+FN fe fe_one() {
     fe h;
 #pragma unroll
     for (int i = 0; i < 10; i++) h.v[i] = 0;
@@ -43,20 +50,20 @@ __device__ __forceinline__ fe fe_one() {
 }
 
 // ref10's carry chain, from 64-bit column sums to a tight element.
-__device__ __forceinline__ fe fe_carry(i64 h[10]) {
+FN fe fe_carry(LOCAL_I64_PTR h) {
     i64 c;
-    c = (h[0] + (1LL << 25)) >> 26; h[1] += c; h[0] -= c << 26;
-    c = (h[4] + (1LL << 25)) >> 26; h[5] += c; h[4] -= c << 26;
-    c = (h[1] + (1LL << 24)) >> 25; h[2] += c; h[1] -= c << 25;
-    c = (h[5] + (1LL << 24)) >> 25; h[6] += c; h[5] -= c << 25;
-    c = (h[2] + (1LL << 25)) >> 26; h[3] += c; h[2] -= c << 26;
-    c = (h[6] + (1LL << 25)) >> 26; h[7] += c; h[6] -= c << 26;
-    c = (h[3] + (1LL << 24)) >> 25; h[4] += c; h[3] -= c << 25;
-    c = (h[7] + (1LL << 24)) >> 25; h[8] += c; h[7] -= c << 25;
-    c = (h[4] + (1LL << 25)) >> 26; h[5] += c; h[4] -= c << 26;
-    c = (h[8] + (1LL << 25)) >> 26; h[9] += c; h[8] -= c << 26;
-    c = (h[9] + (1LL << 24)) >> 25; h[0] += c * 19; h[9] -= c << 25;
-    c = (h[0] + (1LL << 25)) >> 26; h[1] += c; h[0] -= c << 26;
+    c = (h[0] + ((i64)1 << 25)) >> 26; h[1] += c; h[0] -= c << 26;
+    c = (h[4] + ((i64)1 << 25)) >> 26; h[5] += c; h[4] -= c << 26;
+    c = (h[1] + ((i64)1 << 24)) >> 25; h[2] += c; h[1] -= c << 25;
+    c = (h[5] + ((i64)1 << 24)) >> 25; h[6] += c; h[5] -= c << 25;
+    c = (h[2] + ((i64)1 << 25)) >> 26; h[3] += c; h[2] -= c << 26;
+    c = (h[6] + ((i64)1 << 25)) >> 26; h[7] += c; h[6] -= c << 26;
+    c = (h[3] + ((i64)1 << 24)) >> 25; h[4] += c; h[3] -= c << 25;
+    c = (h[7] + ((i64)1 << 24)) >> 25; h[8] += c; h[7] -= c << 25;
+    c = (h[4] + ((i64)1 << 25)) >> 26; h[5] += c; h[4] -= c << 26;
+    c = (h[8] + ((i64)1 << 25)) >> 26; h[9] += c; h[8] -= c << 26;
+    c = (h[9] + ((i64)1 << 24)) >> 25; h[0] += c * 19; h[9] -= c << 25;
+    c = (h[0] + ((i64)1 << 25)) >> 26; h[1] += c; h[0] -= c << 26;
     fe out;
 #pragma unroll
     for (int i = 0; i < 10; i++) out.v[i] = (i32)h[i];
@@ -65,7 +72,7 @@ __device__ __forceinline__ fe fe_carry(i64 h[10]) {
 
 // Limb i times limb j lands at limb (i+j) mod 10, times 2 when both are odd
 // (their half bits add up) and times 19 when it wraps (2^255 = 19).
-__device__ __forceinline__ fe fe_mul(const fe& f, const fe& g) {
+FN fe fe_mul(fe f, fe g) {
     i64 h[10];
 #pragma unroll
     for (int k = 0; k < 10; k++) h[k] = 0;
@@ -82,7 +89,7 @@ __device__ __forceinline__ fe fe_mul(const fe& f, const fe& g) {
 }
 
 // As fe_mul(f, f), but each cross term f_i f_j (i < j) once, doubled.
-__device__ __forceinline__ fe fe_sq(const fe& f) {
+FN fe fe_sq(fe f) {
     i64 h[10];
 #pragma unroll
     for (int k = 0; k < 10; k++) h[k] = 0;
@@ -99,13 +106,13 @@ __device__ __forceinline__ fe fe_sq(const fe& f) {
     return fe_carry(h);
 }
 
-__device__ __forceinline__ fe fe_sq_n(fe f, int n) {
+FN fe fe_sq_n(fe f, int n) {
     for (int i = 0; i < n; i++) f = fe_sq(f);
     return f;
 }
 
 // z^(p-2), ref10's addition chain.
-__device__ fe fe_invert(const fe& z) {
+FN fe fe_invert(fe z) {
     fe z2 = fe_sq(z);
     fe z9 = fe_mul(fe_sq_n(z2, 2), z);
     fe z11 = fe_mul(z9, z2);
@@ -121,11 +128,11 @@ __device__ fe fe_invert(const fe& z) {
 }
 
 // 32 little-endian bytes (as 8 little-endian words) to limbs; bit 255 dropped.
-__device__ fe fe_from_words(const u32 w[8]) {
+FN fe fe_from_words(LOCAL_U32_PTR w) {
     fe h;
 #pragma unroll
     for (int i = 0; i < 10; i++) {
-        const int bit = LIMB_BIT[i], word = bit >> 5, shift = bit & 31;
+        const int bit = limb_bit(i), word = bit >> 5, shift = bit & 31;
         u64 v = w[word];
         if (word + 1 < 8) v |= (u64)w[word + 1] << 32;
         const u32 mask = (i & 1) ? 0x1FFFFFF : 0x3FFFFFF;
@@ -135,8 +142,10 @@ __device__ fe fe_from_words(const u32 w[8]) {
 }
 
 // A tight element to its canonical 32 bytes, as 8 little-endian words (ref10).
-__device__ void fe_to_words(fe f, u32 out[8]) {
-    i32* h = f.v;
+FN void fe_to_words(fe f, LOCAL_U32_PTR out) {
+    i32 h[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++) h[i] = f.v[i];
     i32 q = (19 * h[9] + (1 << 24)) >> 25;
     q = (h[0] + q) >> 26; q = (h[1] + q) >> 25; q = (h[2] + q) >> 26; q = (h[3] + q) >> 25;
     q = (h[4] + q) >> 26; q = (h[5] + q) >> 25; q = (h[6] + q) >> 26; q = (h[7] + q) >> 25;
@@ -157,7 +166,7 @@ __device__ void fe_to_words(fe f, u32 out[8]) {
     for (int i = 0; i < 8; i++) out[i] = 0;
 #pragma unroll
     for (int i = 0; i < 10; i++) {
-        const int bit = LIMB_BIT[i], word = bit >> 5, shift = bit & 31;
+        const int bit = limb_bit(i), word = bit >> 5, shift = bit & 31;
         const u64 v = (u64)(u32)h[i] << shift;
         out[word] |= (u32)v;
         if (word + 1 < 8) out[word + 1] |= (u32)(v >> 32);
@@ -166,7 +175,7 @@ __device__ void fe_to_words(fe f, u32 out[8]) {
 
 // ---- SHA-256
 
-__device__ __constant__ u32 K256[64] = {
+TABLE u32 K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -176,13 +185,8 @@ __device__ __constant__ u32 K256[64] = {
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
 
-__device__ __forceinline__ u32 rotr(u32 x, int n) { return __funnelshift_r(x, x, n); }
-
-// One compression of `w` (16 big-endian words) into `s`.
-__device__ __forceinline__ void sha256_block(u32 s[8], const u32 w_in[16]) {
-    u32 w[16];
-#pragma unroll
-    for (int i = 0; i < 16; i++) w[i] = w_in[i];
+// One compression of `w` (16 big-endian words, overwritten) into `s`.
+FN void sha256_block(LOCAL_U32_PTR s, LOCAL_U32_PTR w) {
     u32 a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
 #pragma unroll
     for (int i = 0; i < 64; i++) {
@@ -206,17 +210,16 @@ __device__ __forceinline__ void sha256_block(u32 s[8], const u32 w_in[16]) {
     s[0] += a; s[1] += b; s[2] += c; s[3] += d; s[4] += e; s[5] += f; s[6] += g; s[7] += h;
 }
 
-__device__ __forceinline__ void sha256_init(u32 s[8]) {
+FN void sha256_init(LOCAL_U32_PTR s) {
     s[0] = 0x6a09e667; s[1] = 0xbb67ae85; s[2] = 0x3c6ef372; s[3] = 0xa54ff53a;
     s[4] = 0x510e527f; s[5] = 0x9b05688c; s[6] = 0x1f83d9ab; s[7] = 0x5be0cd19;
 }
 
-__device__ __forceinline__ u32 bswap(u32 x) { return __byte_perm(x, 0, 0x0123); }
-
 // The first 4 big-endian words of the LXMF address for X25519 public key u.
-// ed[8]: the Ed25519 public key as big-endian words. nh[3]: the name hash's
-// 10 bytes as big-endian words, the last holding two bytes in its top half.
-__device__ void lxmf_address(const u32 u[8], const u32 ed[8], const u32 nh[3], u32 out[4]) {
+// ed: the Ed25519 public key as 8 big-endian words. nh: the name hash's 10
+// bytes as 3 big-endian words, the last holding two bytes in its top half.
+FN void lxmf_address(LOCAL_U32_PTR u, LOCAL_U32_PTR ed, LOCAL_U32_PTR nh,
+                     LOCAL_U32_PTR out) {
     u32 w[16];
     u32 s[8];
     // identity hash = SHA-256(u || ed)[0..16]: a full block, then padding.
@@ -249,19 +252,22 @@ __device__ void lxmf_address(const u32 u[8], const u32 ed[8], const u32 nh[3], u
     for (int i = 0; i < 4; i++) out[i] = t[i];
 }
 
-// ---- Kernels
+// ---- One thread's work
 
 // Per-thread state: X(n-1), Z(n-1), X(n), Z(n) as 4 x 10 limbs.
 #define STATE_INTS 40
 
-// Sets up each thread from u(k-8) and u(k): 16 little-endian words each.
-extern "C" __global__ void init_walk(i32* state, const u32* u_prev_cur, u32 threads) {
-    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= threads) return;
-    const fe xp = fe_from_words(u_prev_cur + t * 16);
-    const fe xc = fe_from_words(u_prev_cur + t * 16 + 8);
+// Sets up thread t from u(k-8) and u(k): 16 little-endian words.
+FN void init_thread(u32 t, GLOBAL i32* state, GLOBAL const u32* u_prev_cur) {
+    u32 w[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = u_prev_cur[t * 16 + i];
+    const fe xp = fe_from_words(w);
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = u_prev_cur[t * 16 + 8 + i];
+    const fe xc = fe_from_words(w);
     const fe one = fe_one();
-    i32* st = state + (u64)t * STATE_INTS;
+    GLOBAL i32* st = state + (u64)t * STATE_INTS;
 #pragma unroll
     for (int i = 0; i < 10; i++) {
         st[i] = xp.v[i];
@@ -271,33 +277,33 @@ extern "C" __global__ void init_walk(i32* state, const u32* u_prev_cur, u32 thre
     }
 }
 
-// Walks `iters` batches per thread. Thread t's next key is k_t + 8 n[t].
-// A key whose address matches (addr & mask) == want is recorded in `hits`
-// as (t, n). With `dump`, the first `dump_threads` threads also write the
-// public keys of their first batch there (for the self-test).
-extern "C" __global__ void walk(i32* state, u64* ns, u32 threads, u32 iters,
-                                const u32* ed, u32 nh0, u32 nh1, u32 nh2,
-                                const u32* want, const u32* mask,
-                                u32* hit_count, u64* hits, u32 max_hits,
-                                u32* dump, u32 dump_threads,
-                                const u32* q_words) {
-    const u32 t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= threads) return;
-
+// Walks `iters` batches for thread t, whose next key is k_t + 8 ns[t]. A key
+// whose address matches (address & mask) == want is recorded in `hits` as
+// (t, n). The first `dump_threads` threads also write the public keys of
+// their first batch to `dump` (for the self-test).
+FN void walk_thread(u32 t, GLOBAL i32* state, GLOBAL u64* ns, u32 iters,
+                    GLOBAL const u32* ed, u32 nh0, u32 nh1, u32 nh2,
+                    GLOBAL const u32* want, GLOBAL const u32* mask,
+                    GLOBAL HIT_COUNTER* hit_count, GLOBAL u64* hits, u32 max_hits,
+                    GLOBAL u32* dump, u32 dump_threads, GLOBAL const u32* q_words) {
     u32 edl[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) edl[i] = ed[i];
-    const u32 nh[3] = {nh0, nh1, nh2};
+    u32 nh[3];
+    nh[0] = nh0; nh[1] = nh1; nh[2] = nh2;
     u32 wantl[4], maskl[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) { wantl[i] = want[i]; maskl[i] = mask[i]; }
 
     // u(8B) + 1 and u(8B) - 1, for the differential addition.
-    const fe q = fe_from_words(q_words);
+    u32 qw[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) qw[i] = q_words[i];
+    const fe q = fe_from_words(qw);
     const fe q_plus = fe_add(q, fe_one());
     const fe q_minus = fe_sub(q, fe_one());
 
-    i32* st = state + (u64)t * STATE_INTS;
+    GLOBAL i32* st = state + (u64)t * STATE_INTS;
     fe xp, zp, xc, zc;
 #pragma unroll
     for (int i = 0; i < 10; i++) {
@@ -318,7 +324,7 @@ extern "C" __global__ void walk(i32* state, u64* ns, u32 threads, u32 iters,
             xp = xc; zp = zc; xc = xn; zc = zn;
         }
         // Montgomery's trick: one inversion for the batch. prefix[i] is the
-        // product of zs[0..i].
+        // product of zs[0] .. zs[i-1].
         fe acc = fe_one();
         fe prefix[BATCH];
         for (int i = 0; i < BATCH; i++) {
@@ -331,7 +337,7 @@ extern "C" __global__ void walk(i32* state, u64* ns, u32 threads, u32 iters,
             inv = fe_mul(inv, zs[i]);
             u32 u[8];
             fe_to_words(fe_mul(xs[i], z_inv), u);
-            if (dump != 0 && it == 0 && t < dump_threads) {
+            if (it == 0 && t < dump_threads) {
 #pragma unroll
                 for (int k = 0; k < 8; k++) dump[((u64)t * BATCH + i) * 8 + k] = u[k];
             }
@@ -341,7 +347,7 @@ extern "C" __global__ void walk(i32* state, u64* ns, u32 threads, u32 iters,
 #pragma unroll
             for (int k = 0; k < 4; k++) match = match && ((addr[k] & maskl[k]) == wantl[k]);
             if (match) {
-                const u32 slot = atomicAdd(hit_count, 1);
+                const u32 slot = ATOMIC_INC(hit_count);
                 if (slot < max_hits) {
                     hits[slot * 2] = t;
                     hits[slot * 2 + 1] = n + i;

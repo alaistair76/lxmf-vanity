@@ -60,7 +60,7 @@ logs=$(mktemp -d)
 
 echo "Building on ${HOSTS[*]}..."
 for h in "${HOSTS[@]}"; do
-    (rsync -a --exclude target --exclude hosts "$here/" "$h:$REMOTE_DIR/" &&
+    (rsync -a --delete --exclude target --exclude hosts --exclude .git --exclude .codegraph "$here/" "$h:$REMOTE_DIR/" &&
         ssh "$h" "cd $REMOTE_DIR && ~/.cargo/bin/cargo build -q --release --features cuda") >"$logs/$h.build" 2>&1 &
 done
 if ! wait; then
