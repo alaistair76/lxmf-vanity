@@ -1,0 +1,7 @@
+/target
+# Your machines (see hosts.example)
+hosts
+# Identity files hold private keys
+*.identity
+# Local code index
+.codegraph/

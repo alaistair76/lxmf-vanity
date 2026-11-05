@@ -1,0 +1,27 @@
+[package]
+name = "lxmf-vanity"
+version = "0.1.0"
+edition = "2024"
+description = "Find a Reticulum identity whose LXMF address starts with a chosen hex prefix, on CPUs or NVIDIA GPUs"
+license = "MIT"
+repository = "https://github.com/alaistair76/lxmf-vanity"
+keywords = ["reticulum", "lxmf", "vanity", "cuda"]
+
+[dependencies]
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional = true }
+curve25519-dalek = "5"
+ed25519-dalek = "3.0.0"
+fiat-crypto = "0.3.0"
+getrandom = "0.4.3"
+sha2 = "0.11.1"
+x25519-dalek = "3.0.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.test]
+opt-level = 3
+
+[features]
+cuda = ["dep:cudarc"]

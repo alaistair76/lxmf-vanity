@@ -1,0 +1,5 @@
+# One ssh destination per line: a Host from ~/.ssh/config, or user@address.
+# Copy to ./hosts (git-ignored) and edit.
+gpu1
+gpu2
+user@192.0.2.10
